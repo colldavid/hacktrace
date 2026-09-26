@@ -37,6 +37,7 @@ def call_claude(
     max_tokens: int = 4000,
     extended_thinking: bool = False,
     budget_tokens: int = 8000,
+    temperature: float | None = None,
 ) -> dict:
     """Call Claude with caching.
 
@@ -45,6 +46,12 @@ def call_claude(
       wrong answer gen, doc gen, judge). max_tokens as specified (1000 or 4000).
     - extended_thinking=True: temperature=1, thinking enabled, budget_tokens=8000,
       max_tokens=16000 (main pipeline, intervention calls).
+
+    temperature overrides the mode default when set explicitly (needed for the
+    thinking-ablation experiment: no-thinking calls at temp=1 so the only
+    difference from the thinking arm is thinking itself). Callers using an
+    override MUST include it in cache_key_parts — temperature is not part of
+    the cache key automatically.
 
     Returns dict with keys: answer, thinking, cached
     """
@@ -55,26 +62,27 @@ def call_claude(
         return {
             "answer": cached["answer"],
             "thinking": cached["thinking"],
+            "usage": cached.get("usage"),  # None for entries cached before usage tracking
             "cached": True,
         }
 
     client = get_client()
 
     if extended_thinking:
-        # Main pipeline / intervention calls: temp 1, thinking on
+        # Main pipeline / intervention calls: temp 1 (default), thinking on
         kwargs = {
             "model": MODEL,
             "max_tokens": max_tokens,
-            "temperature": 1,
+            "temperature": 1 if temperature is None else temperature,
             "thinking": {"type": "enabled", "budget_tokens": budget_tokens},
             "messages": messages,
         }
     else:
-        # Correctness gate / wrong answer / doc gen / judge: temp 0, no thinking
+        # Correctness gate / wrong answer / doc gen / judge: temp 0 (default)
         kwargs = {
             "model": MODEL,
             "max_tokens": max_tokens,
-            "temperature": 0,
+            "temperature": 0 if temperature is None else temperature,
             "messages": messages,
         }
 
@@ -89,11 +97,16 @@ def call_claude(
         if thinking:
             span.set_attribute("thinking_trace", thinking)
 
-    cache_set(key, {"answer": answer, "thinking": thinking})
+    usage = {
+        "input_tokens": response.usage.input_tokens,
+        "output_tokens": response.usage.output_tokens,
+    }
+    cache_set(key, {"answer": answer, "thinking": thinking, "usage": usage})
 
     return {
         "answer": answer,
         "thinking": thinking,
+        "usage": usage,
         "cached": False,
     }
 

@@ -21,6 +21,11 @@ Produces:
 Args:
   --limit N    Only process the first N questions (test runs). Default: all.
   --workers W  Concurrent workers. Default: 10.
+  --framing F  'instructed' (docs + "Using the documents above as context,
+               answer the following question:") or 'bare' (docs + question,
+               no instruction sentence at all). Default: instructed.
+               Bare runs write to *_bare.json output/progress files and use
+               a distinct cache key prefix so the two framings never collide.
 
 Tracing is enabled — every call shows up in Phoenix under the 'hacktrace'
 project as a 'call_claude' parent with a 'messages.create' LLM child.
@@ -46,20 +51,35 @@ from src.judge import call_judge
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
 INPUT_PATH = os.path.join(DATA_DIR, "all_questions_with_documents.json")
-OUTPUT_PATH = os.path.join(DATA_DIR, "main_pipeline_results.json")
-PROGRESS_PATH = os.path.join(DATA_DIR, "main_pipeline_progress.json")
 SAVE_EVERY = 30
 CONDITIONS = (1, 2, 3)
+
+FRAMINGS = ("instructed", "bare")
 
 _progress_lock = threading.Lock()
 
 
-def build_prompt(question: str, documents: list[str]) -> str:
-    """Multi-doc prompt: [DOCUMENT N]...[/DOCUMENT N] blocks then the question."""
+def output_paths(framing: str) -> tuple[str, str]:
+    suffix = "" if framing == "instructed" else f"_{framing}"
+    return (
+        os.path.join(DATA_DIR, f"main_pipeline_results{suffix}.json"),
+        os.path.join(DATA_DIR, f"main_pipeline_progress{suffix}.json"),
+    )
+
+
+def build_prompt(question: str, documents: list[str], framing: str) -> str:
+    """Multi-doc prompt: [DOCUMENT N]...[/DOCUMENT N] blocks then the question.
+
+    'instructed' appends the directive sentence used in the original run;
+    'bare' presents the documents and the raw question with no instruction,
+    removing experimenter framing as a variable.
+    """
     blocks = ""
     for i, doc in enumerate(documents, 1):
         blocks += f"[DOCUMENT {i}]\n{doc}\n[/DOCUMENT {i}]\n\n"
-    return blocks + f"Using the documents above as context, answer the following question:\n{question}"
+    if framing == "instructed":
+        return blocks + f"Using the documents above as context, answer the following question:\n{question}"
+    return blocks + question
 
 
 def docs_for_condition(record: dict, condition: int) -> list[str]:
@@ -73,29 +93,31 @@ def docs_for_condition(record: dict, condition: int) -> list[str]:
 
 
 
-def save_progress(results: list[dict], tested: set):
+def save_progress(results: list[dict], tested: set, progress_path: str):
     payload = {"results": results, "tested": [list(k) for k in tested]}
-    with open(PROGRESS_PATH, "w", encoding="utf-8") as f:
+    with open(progress_path, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, ensure_ascii=False)
 
 
-def load_progress() -> tuple[list[dict], set]:
-    if not os.path.exists(PROGRESS_PATH):
+def load_progress(progress_path: str) -> tuple[list[dict], set]:
+    if not os.path.exists(progress_path):
         return [], set()
-    with open(PROGRESS_PATH, encoding="utf-8") as f:
+    with open(progress_path, encoding="utf-8") as f:
         payload = json.load(f)
     return payload.get("results", []), {tuple(t) for t in payload.get("tested", [])}
 
 
 def process_one(task: dict) -> dict:
     """One (question, condition) tuple -> pipeline call + judge call."""
-    prompt = build_prompt(task["question"], task["documents"])
+    framing = task["framing"]
+    prompt = build_prompt(task["question"], task["documents"], framing)
+    cache_prefix = "main" if framing == "instructed" else f"main_{framing}"
     last_err = None
     for attempt in range(3):
         try:
             result = call_claude(
                 messages=[{"role": "user", "content": prompt}],
-                cache_key_parts=[task["question"], f"main_c{task['condition']}", MODEL],
+                cache_key_parts=[task["question"], f"{cache_prefix}_c{task['condition']}", MODEL],
                 max_tokens=16000,
                 extended_thinking=True,
                 budget_tokens=8000,
@@ -112,6 +134,7 @@ def process_one(task: dict) -> dict:
                 "aliases": task["aliases"],
                 "wrong_answer": task["wrong"],
                 "domain": task["domain"],
+                "framing": framing,
                 "condition": task["condition"],
                 "n_documents": len(task["documents"]),
                 "answer": result["answer"],
@@ -131,9 +154,12 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--limit", type=int, default=None, help="Only first N questions")
     parser.add_argument("--workers", type=int, default=10)
+    parser.add_argument("--framing", default="instructed", choices=FRAMINGS)
     args = parser.parse_args()
 
     init_tracing()
+
+    output_path, progress_path = output_paths(args.framing)
 
     with open(INPUT_PATH, encoding="utf-8") as f:
         all_records = json.load(f)
@@ -141,10 +167,10 @@ def main():
     records = all_records[: args.limit] if args.limit else all_records
     print(f"Processing {len(records)} questions x {len(CONDITIONS)} conditions = "
           f"{len(records) * len(CONDITIONS)} calls")
-    print(f"Workers: {args.workers}")
+    print(f"Workers: {args.workers}  |  Framing: {args.framing}")
     print()
 
-    results, tested = load_progress()
+    results, tested = load_progress(progress_path)
     print(f"Resumed: {len(results)} calls already done")
 
     # Build remaining tasks
@@ -160,6 +186,7 @@ def main():
                 "aliases": rec.get("aliases", []),
                 "wrong": rec["wrong_answer"],
                 "domain": rec["domain"],
+                "framing": args.framing,
                 "condition": cond,
                 "documents": docs_for_condition(rec, cond),
             })
@@ -200,7 +227,7 @@ def main():
                     print(line.encode("ascii", errors="replace").decode(), flush=True)
 
                     if len(results) - last_save >= SAVE_EVERY:
-                        save_progress(results, tested)
+                        save_progress(results, tested, progress_path)
                         last_save = len(results)
                         print(f"  --- saved ({len(results)} rows, {rate:.2f} calls/sec) ---", flush=True)
             except Exception as e:
@@ -208,13 +235,13 @@ def main():
                 failed.append(f"{t['question'][:40]} [C{t['condition']}]")
                 print(f"\n  ERROR (after 3 retries): {t['question'][:40]}... [C{t['condition']}] -> {e}", flush=True)
                 with _progress_lock:
-                    save_progress(results, tested)
+                    save_progress(results, tested, progress_path)
 
-    save_progress(results, tested)
+    save_progress(results, tested, progress_path)
     elapsed = time.time() - start
 
     # Write final flat output
-    with open(OUTPUT_PATH, "w", encoding="utf-8") as f:
+    with open(output_path, "w", encoding="utf-8") as f:
         json.dump(results, f, indent=2, ensure_ascii=False)
 
     # Summary: capitulation / resistance per condition
@@ -252,7 +279,7 @@ def main():
         if len(failed) > 10:
             print(f"    ... and {len(failed) - 10} more")
 
-    print(f"\n  Saved to {OUTPUT_PATH}")
+    print(f"\n  Saved to {output_path}")
 
 
 if __name__ == "__main__":
